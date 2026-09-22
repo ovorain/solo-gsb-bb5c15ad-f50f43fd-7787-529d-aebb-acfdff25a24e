@@ -13,6 +13,8 @@ from pydantic import BaseModel, Field
 from . import crud
 from .config import STATIC_DIR
 from .consensus import analyze
+from . import correlation
+from .correlation import CorrelationError, REASON_TEXT
 from .database import init_db
 from .demo import create_demo_dataset
 from .importer import ImportError_, parse_payload
@@ -61,6 +63,19 @@ class ConflictGroupRef(BaseModel):
 
 class ConflictResolveIn(BaseModel):
     groups: list[ConflictGroupRef] = Field(min_length=1)
+
+
+class CorrelationPreviewIn(BaseModel):
+    template_pick_id: int
+    channel: str = Field(min_length=1, max_length=20)
+    half_window_ms: int = Field(ge=1, le=60000)
+    max_shift_ms: int = Field(ge=1, le=120000)
+    min_coefficient: float = Field(ge=0.0, le=1.0)
+    target_stations: list[str] | None = Field(default=None, max_length=200)
+
+
+class CorrelationApplyIn(CorrelationPreviewIn):
+    stations: list[str] = Field(min_length=1, max_length=200)
 
 
 # ------------------------------------------------------------- datasets ------
@@ -186,6 +201,92 @@ def api_delete_dataset(ds_id: int) -> dict[str, str]:
     _require_dataset(ds_id)
     crud.delete_dataset(ds_id)
     return {"status": "deleted"}
+
+
+# --------------------------------------------------------- correlation ------
+def _run_correlation(ds_id: int, body: CorrelationPreviewIn,
+                     stations: list[str] | None) -> dict[str, Any]:
+    pick = crud.get_pick(ds_id, body.template_pick_id)
+    if pick is None:
+        raise HTTPException(status_code=404, detail="模板拾取不存在")
+    channel = body.channel.strip()
+    if not channel:
+        raise HTTPException(status_code=422, detail="通道代码不能为空")
+    target_stations = (
+        [s.strip() for s in body.target_stations if s.strip()]
+        if body.target_stations is not None else None)
+    try:
+        return correlation.preview(
+            crud.get_traces(ds_id), pick, channel,
+            body.half_window_ms, body.max_shift_ms,
+            body.min_coefficient,
+            stations if stations is not None else target_stations,
+        )
+    except CorrelationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/api/datasets/{ds_id}/correlation/preview")
+def api_correlation_preview(ds_id: int,
+                            body: CorrelationPreviewIn) -> dict[str, Any]:
+    _require_dataset(ds_id)
+    return _run_correlation(ds_id, body, None)
+
+
+@app.post("/api/datasets/{ds_id}/correlation/apply")
+def api_correlation_apply(ds_id: int, body: CorrelationApplyIn) -> dict[str, Any]:
+    _require_dataset(ds_id)
+    selected = [s.strip() for s in body.stations if s.strip()]
+    if not selected:
+        raise HTTPException(status_code=422, detail="未选择任何目标台站")
+    preview = _run_correlation(ds_id, body, selected)
+
+    template_pick = crud.get_pick(ds_id, body.template_pick_id)
+    proposals: list[dict[str, Any]] = []
+    below: list[dict[str, Any]] = []
+    unavailable: list[dict[str, Any]] = []
+    for r in preview["results"]:
+        if not r["available"]:
+            r.pop("meets_threshold", None)
+            unavailable.append(r)
+            continue
+        if not r["meets_threshold"]:
+            below.append({
+                "station": r["station"], "phase": r["phase"],
+                "time": r["time"], "coefficient": r["coefficient"],
+                "shift_ms": r["shift_ms"],
+                "reason": "below_threshold",
+                "reason_text": REASON_TEXT[
+                    correlation.REASON_BELOW_THRESHOLD]
+                               + f"（{r['coefficient']:.3f} "
+                               + f"< {body.min_coefficient:g}）",
+            })
+            continue
+        # Guard against times outside the target station's waveform span.
+        try:
+            _check_station_time(ds_id, r["station"], r["time"])
+        except HTTPException:
+            unavailable.append({**r, "available": False,
+                                "meets_threshold": False,
+                                "reason": "insufficient_coverage",
+                                "reason_text": REASON_TEXT[
+                                    correlation.REASON_INSUFFICIENT_COVERAGE]})
+            continue
+        proposals.append(r)
+
+    source = (f"xcorr#{body.template_pick_id}"
+              f"@{template_pick['station']}/{body.channel.strip()}")[:40]
+    outcome = crud.create_correlated_picks(
+        ds_id, proposals,
+        uncertainty_ms=template_pick["uncertainty"],
+        source=source, weight=template_pick["weight"])
+    outcome["below_threshold"] = below
+    outcome["unavailable"] = unavailable
+
+    fresh = analyze(crud.get_picks(ds_id))
+    fresh["reviews"] = crud.get_reviews(ds_id)
+    fresh["last_resolution"] = crud.get_last_conflict_resolution(ds_id)
+    return {"propagation": outcome, "analysis": fresh}
 
 
 @app.get("/api/datasets/{ds_id}/export")

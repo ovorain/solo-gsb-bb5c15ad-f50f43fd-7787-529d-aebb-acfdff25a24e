@@ -1,9 +1,10 @@
 import { api } from "./api.js";
 import type {
-  Analysis, AugmentedPick, Group, Phase, Pick,
+  Analysis, AugmentedPick, CorrelationPreview, Group, Phase, Pick, Trace,
 } from "./types.js";
 import { WaveformView } from "./waveform.js";
 import { ReviewPanel } from "./panel.js";
+import { CorrelationDialog } from "./correlation.js";
 import {
   fmtRelative, localInputToMs, msToIso, msToLocalInput,
 } from "./time.js";
@@ -14,12 +15,14 @@ const $ = <T extends HTMLElement = HTMLButtonElement>(sel: string) =>
 class App {
   private dsId: number | null = null;
   private analysis: Analysis | null = null;
+  private traces: Trace[] = [];
   private fullStart = 0;
   private selectedPickId: number | null = null;
   private dragTimer: number | null = null;
 
   private wave: WaveformView;
   private panel: ReviewPanel;
+  private corrDialog: CorrelationDialog;
 
   constructor() {
     this.wave = new WaveformView(
@@ -46,6 +49,18 @@ class App {
       onFocusTime: (t) => this.wave.focusTime(t),
       onResolveConflicts: (groups) => this.resolveConflicts(groups),
       onUndoResolution: (id) => this.undoResolution(id),
+    });
+
+    this.corrDialog = new CorrelationDialog({
+      getPicks: () => this.allPicks(),
+      getTraces: () => this.traces,
+      preview: (params) => api.correlationPreview(this.dsId!, params),
+      apply: (params, stations) =>
+        api.correlationApply(this.dsId!, params, stations),
+      locate: (station, t) => this.wave.locateCorrelation(station, t),
+      onApplied: (analysis) => this.applyAnalysis(analysis),
+      onPreviewChange: (preview) => this.onCorrelationPreview(preview),
+      toast: (msg, isError) => this.toast(msg, isError),
     });
 
     this.bindChrome();
@@ -88,6 +103,7 @@ class App {
         await api.deleteDataset(this.dsId!);
         this.dsId = null;
         this.analysis = null;
+        this.traces = [];
         this.selectPick(null);
         this.wave.clear();
         this.panel.render({
@@ -97,11 +113,17 @@ class App {
         $("#empty-state").style.display = "";
         $("#btn-export").disabled = true;
         $("#btn-delete").disabled = true;
+        $("#btn-correlate").disabled = true;
         await this.refreshDatasetList(null);
       }, "删除失败");
     });
     $("#btn-reset-view").addEventListener("click", () =>
       this.wave.resetView());
+
+    $("#btn-correlate").addEventListener("click", () =>
+      this.corrDialog.open(this.selectedPickId));
+    $("#pe-correlate").addEventListener("click", () =>
+      this.corrDialog.open(this.selectedPickId));
 
     document.querySelectorAll<HTMLInputElement>("input[name='new-phase']")
       .forEach(r => r.addEventListener("change", () => {
@@ -174,6 +196,7 @@ class App {
     this.selectPick(null);
     const detail = await api.getDetail(id);
     this.fullStart = detail.dataset.start_time;
+    this.traces = detail.traces;
     const analysis = await api.getAnalysis(id);
     this.analysis = analysis;
     this.wave.setData(detail.traces, analysis);
@@ -181,6 +204,7 @@ class App {
     $("#empty-state").style.display = "none";
     $("#btn-export").disabled = false;
     $("#btn-delete").disabled = false;
+    $("#btn-correlate").disabled = false;
   }
 
   private async reloadAnalysis() {
@@ -196,6 +220,31 @@ class App {
     this.panel.setSelected(this.selectedPickId);
     this.wave.setSelected(this.selectedPickId);
     this.refreshEditor();
+  }
+
+  // ------------------------------------------------------- correlation -----
+  private allPicks(): Pick[] {
+    if (!this.analysis) return [];
+    const out: Pick[] = [];
+    for (const g of this.analysis.groups) out.push(...g.picks);
+    out.push(...this.analysis.rejected);
+    return out;
+  }
+
+  private onCorrelationPreview(preview: CorrelationPreview | null) {
+    if (!preview) {
+      this.wave.setCorrelationOverlay(null, []);
+      return;
+    }
+    this.wave.setCorrelationOverlay(preview.template, preview.results);
+    // zoom to cover the template time and every proposed arrival
+    const times = [preview.template.time,
+      ...preview.results.map(r => r.time).filter((t): t is number => t != null)];
+    if (times.length) {
+      const lo = Math.min(...times);
+      const hi = Math.max(...times);
+      this.wave.focusRange(lo, hi, 4000);
+    }
   }
 
   // ----------------------------------------------------------- picks -------

@@ -149,6 +149,62 @@ def delete_pick(ds_id: int, pick_id: int) -> None:
         )
 
 
+def create_correlated_picks(
+    ds_id: int,
+    proposals: list[dict[str, Any]],
+    *,
+    uncertainty_ms: int,
+    source: str,
+    weight: float = 1.0,
+) -> list[dict[str, Any]]:
+    """Create propagated picks in one transaction.
+
+    ``proposals`` are validated (station, phase, time) correlation hits.  An
+    existing pick with the same station/phase/time (candidate *or* rejected)
+    makes the proposal a skip; the conflicting pick is reported back.  All
+    inserts happen inside a single transaction so a failure rolls back every
+    pick created by the propagation.
+    """
+    stamp = ms_to_iso(now_ms())
+    created: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    with db() as conn:
+        for prop in proposals:
+            dup = conn.execute(
+                "SELECT id, status, source FROM picks "
+                "WHERE dataset_id = ? AND station = ? AND phase = ? AND time = ?",
+                (ds_id, prop["station"], prop["phase"], prop["time"]),
+            ).fetchone()
+            if dup is not None:
+                skipped.append({
+                    "station": prop["station"], "phase": prop["phase"],
+                    "time": prop["time"],
+                    "coefficient": prop.get("coefficient"),
+                    "shift_ms": prop.get("shift_ms"),
+                    "reason": "duplicate_existing",
+                    "reason_text": "同台站同震相同到时拾取已存在，已跳过",
+                    "existing_pick_id": dup["id"],
+                    "existing_status": dup["status"],
+                })
+                continue
+            cur = conn.execute(
+                "INSERT INTO picks (dataset_id, station, phase, time, "
+                "uncertainty, source, weight, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'candidate', ?)",
+                (ds_id, prop["station"], prop["phase"], prop["time"],
+                 uncertainty_ms, source, weight, stamp),
+            )
+            created.append({
+                "id": cur.lastrowid, "station": prop["station"],
+                "phase": prop["phase"], "time": prop["time"],
+                "uncertainty": uncertainty_ms, "source": source,
+                "weight": weight, "status": "candidate",
+                "coefficient": prop.get("coefficient"),
+                "shift_ms": prop.get("shift_ms"),
+            })
+    return {"created": created, "skipped": skipped}
+
+
 def get_reviews(ds_id: int) -> list[dict[str, Any]]:
     with db() as conn:
         rows = conn.execute(

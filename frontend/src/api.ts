@@ -1,5 +1,6 @@
 import type {
-  Analysis, DatasetDetail, DatasetMeta, Phase,
+  Analysis, CorrelationApplyResponse, CorrelationParams,
+  CorrelationPreview, DatasetDetail, DatasetMeta, Phase,
   ResolveConflictsResponse, Review, UndoConflictsResponse,
 } from "./types.js";
 
@@ -87,6 +88,15 @@ export const api = {
     req<UndoConflictsResponse>(
       `/api/datasets/${ds}/conflict-resolutions/${resolutionId}/undo`,
       jsonInit("POST")),
+
+  correlationPreview: (ds: number, params: CorrelationParams) =>
+    req<CorrelationPreview>(
+      `/api/datasets/${ds}/correlation/preview`, jsonInit("POST", params)),
+
+  correlationApply: (ds: number, params: CorrelationParams, stations: string[]) =>
+    req<CorrelationApplyResponse>(
+      `/api/datasets/${ds}/correlation/apply`,
+      jsonInit("POST", { ...params, stations })),
 
   exportUrl: (id: number) => `/api/datasets/${id}/export`,
 };

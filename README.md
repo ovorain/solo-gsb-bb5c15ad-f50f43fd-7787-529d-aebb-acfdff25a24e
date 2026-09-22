@@ -18,6 +18,9 @@ docker compose up --build
 SQLite 数据库保存在命名卷 `seismic-data` 中，容器重建后数据保留。
 停止服务：`docker compose down`（加 `-v` 同时删除数据卷）。
 
+> 若 8000 端口被占用，修改 `docker-compose.yml` 中 `"8000:8000"` 左侧宿主端口
+> （如 `"18000:8000"`），再访问 <http://localhost:18000> 即可。
+
 ## 本地开发（无 Docker）
 
 ```bash
@@ -112,6 +115,7 @@ npm run watch
 | 「拒绝」/「恢复」 | 排除或重新纳入某条候选拾取 |
 | 冲突处置台 | 勾选多个存在多簇的台站/震相组，预览主簇与离群簇汇总，一次性拒绝所选离群簇拾取 |
 | 「↩ 撤销处置」 | 撤销**最近一次**批量处置，将其中每条拾取恢复为处置前状态（仅最近一次可撤） |
+| 「🔗 相关传播」 | 以现有拾取为模板，预览互相关建议到时并勾选后批量创建（见“相关传播”节） |
 | 「导出审阅结果」 | 下载 JSON（见下） |
 
 ## 冲突处置工作流
@@ -128,6 +132,36 @@ npm run watch
 - 只保留**最近一次**处置可撤销；又做了新的处置后，旧处置不可再撤销（返回 409）。
 
 处置完成后冲突、共识与导出结果随分析接口立即刷新，审阅面板的「待处置 N 组 / M 条离群」徽标同步更新。
+
+## 相关传播（模板互相关）
+
+波形工具栏的 **「🔗 相关传播」**（或先选中一条拾取、在底部编辑条点
+**「🔗 以此为模板传播」**）打开传播工作台：
+
+1. **选择模板拾取**：任一台站上已有的 P/S 拾取作为模板到时；
+2. 指定 **通道**（默认该台站的垂向道，如 `HHZ`）、**模板窗 ±ms**
+   （以模板到时为中心的对称窗）、**最大时移 ±ms**（以模板到时为中心的搜索范围）、
+   **最低相关系数**，并勾选 **目标台站**（默认除模板台站外所有同通道台站）；
+3. 点 **「计算预览」**：后端把模板波形**线性重采样**到每个目标台站的采样率，
+   在时移范围内逐整数采样点计算**去均值归一化互相关（NCC）**；
+4. 预览表逐台站列出 **建议到时、相对模板的时移、峰值相关系数与匹配波形窗定位**，
+   同时在波形上叠加模板窗（蓝色虚线框）与各建议到时（菱形标记 + `cc=` 系数），
+   点行内「定位」跳转到该台站；**只有达到阈值的台站可被勾选**（默认全选）；
+5. **「确认创建拾取」** 后后端在**单个数据库事务**中创建对应的同震相候选拾取
+   （不确定窗与权重继承自模板，`source` 记为 `xcorr#<模板id>@<台站>/<通道>`），
+   并返回刷新后的聚类/共识分析。
+
+决胜与不可用规则：
+
+- 峰值并列时，先取 **绝对时移更小** 者，再取 **到时更早** 者；
+- **常量窗不可用**：模板窗去均值后能量为零时，所有台站标记为
+  `template_constant`；某个时移位置的目标窗为常量时该滞后跳过，全部为常量则标记
+  `constant_window`（不参与归一化）；
+- **覆盖不足不可用**：台站缺少同通道道（`no_channel`）、模板到时不在该道时间范围内、
+  或时移范围内无法容纳完整模板窗（`insufficient_coverage`）时标记为不可用而非报错；
+- 确认时若目标台站已存在 **同台站 / 同震相 / 同到时（毫秒）** 的候选或已拒绝拾取，
+  该条 **跳过** 并在返回中给出原因 `duplicate_existing` 与既有拾取 id；
+  重新计算后系数已低于阈值的台站返回 `below_threshold`。两种情形都不会写入数据。
 
 ## 导出内容
 
@@ -153,6 +187,14 @@ POST   /api/datasets/{id}/conflict-resolutions
                                              单事务拒绝所选组的离群簇拾取，返回每条变更 + 刷新后的分析
 POST   /api/datasets/{id}/conflict-resolutions/{rid}/undo
                                              撤销最近一次处置（非最近/已撤销返回 409）
+POST   /api/datasets/{id}/correlation/preview
+        body: {"template_pick_id":1,"channel":"HHZ","half_window_ms":300,
+               "max_shift_ms":2000,"min_coefficient":0.7,
+               "target_stations":["STA02", ...]}  // target_stations 省略=全部同通道台站
+                                             逐台站返回建议到时/时移/系数/不可用原因
+POST   /api/datasets/{id}/correlation/apply
+        body: 同上 + {"stations":["STA02", ...]}
+                                             单事务创建拾取；重复同时刻项跳过并说明原因
 POST   /api/datasets/{id}/picks              新增拾取
 PATCH  /api/datasets/{id}/picks/{pid}        修改时间/窗口/权重/震相
 POST   /api/datasets/{id}/picks/{pid}/reject
@@ -171,6 +213,7 @@ DELETE /api/datasets/{id}/reviews/{rid}      撤销接受
 │   ├── app/
 │   │   ├── main.py           # FastAPI 路由
 │   │   ├── consensus.py      # 区间重叠聚类 + 加权共识
+│   │   ├── correlation.py    # 模板线性重采样 + 去均值归一化互相关传播
 │   │   ├── importer.py       # 两种 JSON 形态导入与校验
 │   │   ├── database.py       # SQLite schema / 连接管理
 │   │   ├── crud.py           # 数据持久化
@@ -184,6 +227,7 @@ DELETE /api/datasets/{id}/reviews/{rid}      撤销接受
 │   │   ├── main.ts           # 状态编排与控件绑定
 │   │   ├── waveform.ts       # Canvas 波形渲染、缩放、拾取标记与拖拽
 │   │   ├── panel.ts          # 审阅面板（簇、共识、接受/撤销）
+│   │   ├── correlation.ts    # 相关传播工作台（参数、预览表、确认创建）
 │   │   ├── api.ts / types.ts / time.ts
 │   ├── esbuild (package.json) └─ tsconfig.json
 └── examples/sample-waves.json

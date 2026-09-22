@@ -1,5 +1,6 @@
 import type {
-  Analysis, AugmentedPick, Phase, Pick, Review, Trace,
+  Analysis, AugmentedPick, CorrelationResult, CorrelationTemplateInfo,
+  Phase, Pick, Review, Trace,
 } from "./types.js";
 import { msToIso, niceStep } from "./time.js";
 
@@ -62,6 +63,10 @@ export class WaveformView {
   private selectedPickId: number | null = null;
   private newPhase: Phase = "P";
 
+  // correlation-propagation preview overlay
+  private corrTemplate: CorrelationTemplateInfo | null = null;
+  private corrResults: CorrelationResult[] = [];
+
   // interaction
   private drag:
     | { kind: "pick"; pick: AugmentedPick | Pick; started: boolean; moved: boolean }
@@ -85,6 +90,8 @@ export class WaveformView {
     this.fullRange = { startMs: 0, endMs: 1 };
     this.selectedPickId = null;
     this.blocks = [];
+    this.corrTemplate = null;
+    this.corrResults = [];
     this.layout();
     this.resize();
     this.draw();
@@ -111,6 +118,28 @@ export class WaveformView {
     this.newPhase = phase;
   }
 
+  // ---------------------------------------------------- correlation overlay
+  setCorrelationOverlay(template: CorrelationTemplateInfo | null,
+                        results: CorrelationResult[]) {
+    this.corrTemplate = template;
+    this.corrResults = results;
+    this.draw();
+  }
+
+  clearCorrelationOverlay() {
+    this.setCorrelationOverlay(null, []);
+  }
+
+  /** Scroll a station block and the given arrival into view. */
+  locateCorrelation(station: string, timeMs: number | null) {
+    const b = this.blocks.find(x => x.station === station);
+    if (!b) return;
+    const t = timeMs ?? this.view.startMs;
+    this.focusTime(t, 3000);
+    const top = Math.max(0, b.y - 30);
+    this.scroll.scrollTo({ top, behavior: "smooth" });
+  }
+
   resetView() {
     this.view = { ...this.fullRange };
     this.draw();
@@ -121,6 +150,20 @@ export class WaveformView {
     this.view = {
       startMs: Math.max(this.fullRange.startMs, timeMs - spanMs),
       endMs: Math.min(this.fullRange.endMs, timeMs + spanMs),
+    };
+    this.draw();
+  }
+
+  /** Zoom to cover [lo, hi] (plus padding), used by the correlation preview. */
+  focusRange(lo: number, hi: number, paddingMs = 4000) {
+    const span = Math.max(20, (hi - lo) + 2 * paddingMs);
+    const center = (lo + hi) / 2;
+    let start = Math.round(center - span / 2);
+    start = Math.max(this.fullRange.startMs,
+      Math.min(this.fullRange.endMs - span, start));
+    this.view = {
+      startMs: start,
+      endMs: Math.min(this.fullRange.endMs, Math.round(start + span)),
     };
     this.draw();
   }
@@ -208,6 +251,7 @@ export class WaveformView {
     for (const b of this.blocks) {
       this.drawBlock(ctx, b);
     }
+    this.drawCorrelationOverlay(ctx);
     this.drawCursor(ctx);
   }
 
@@ -420,6 +464,73 @@ export class WaveformView {
     ctx.fillStyle = this.hexA(color, 0.18);
     const wy = b.y + b.height - 7;
     ctx.fillRect(x1, wy, Math.max(1, x2 - x1), 4);
+  }
+
+  private drawCorrelationOverlay(ctx: CanvasRenderingContext2D) {
+    if (!this.corrTemplate) return;
+    const tpl = this.corrTemplate;
+    const tplBlock = this.blocks.find(b => b.station === tpl.station);
+    if (tplBlock) {
+      const x0 = this.xFor(tpl.time - tpl.half_window_ms);
+      const x1 = this.xFor(tpl.time + tpl.half_window_ms);
+      ctx.fillStyle = "rgba(77,163,255,0.10)";
+      ctx.strokeStyle = "rgba(77,163,255,0.55)";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([5, 4]);
+      ctx.fillRect(x0, tplBlock.y, Math.max(1, x1 - x0), tplBlock.height);
+      ctx.strokeRect(x0, tplBlock.y, Math.max(1, x1 - x0), tplBlock.height);
+      ctx.setLineDash([]);
+      ctx.fillStyle = "rgba(180,210,255,0.95)";
+      ctx.font = "bold 10px sans-serif";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "top";
+      ctx.fillText("模板窗", x0 + 3, tplBlock.y + 2);
+    }
+
+    for (const r of this.corrResults) {
+      if (!r.available || r.time == null) continue;
+      const b = this.blocks.find(x => x.station === r.station);
+      if (!b) continue;
+      const x = this.xFor(r.time);
+      if (x < LABEL_W - 4 || x > this.width - RIGHT_PAD + 4) continue;
+      const ok = r.meets_threshold === true;
+      const color = r.phase === "P" ? "#ff7a59" : "#46d39a";
+      const top = b.y + BLOCK_HEADER_H;
+      const bottom = b.y + b.height - BLOCK_GAP;
+      // matched window shade
+      if (r.window_start != null && r.window_end != null) {
+        const x1 = this.xFor(r.window_start);
+        const x2 = this.xFor(r.window_end);
+        ctx.fillStyle = this.hexA(color, ok ? 0.13 : 0.05);
+        ctx.fillRect(x1, top, Math.max(1, x2 - x1), bottom - top);
+      }
+      ctx.strokeStyle = this.hexA(color, ok ? 0.95 : 0.35);
+      ctx.lineWidth = ok ? 2 : 1;
+      ctx.setLineDash(ok ? [] : [3, 4]);
+      ctx.beginPath();
+      ctx.moveTo(x, top);
+      ctx.lineTo(x, bottom);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      // diamond marker
+      ctx.fillStyle = ok ? color : this.hexA(color, 0.45);
+      ctx.beginPath();
+      ctx.moveTo(x, top - 2);
+      ctx.lineTo(x + 5, top + 5);
+      ctx.lineTo(x, top + 12);
+      ctx.lineTo(x - 5, top + 5);
+      ctx.closePath();
+      ctx.fill();
+      if (r.coefficient != null) {
+        ctx.font = "bold 10px monospace";
+        ctx.textAlign = "left";
+        ctx.textBaseline = "bottom";
+        ctx.fillStyle = ok ? "#eef3f9" : "rgba(200,210,222,0.55)";
+        const shift = r.shift_ms == null ? ""
+          : ` Δ${r.shift_ms >= 0 ? "+" : ""}${r.shift_ms}ms`;
+        ctx.fillText(`cc=${r.coefficient.toFixed(2)}${shift}`, x + 7, bottom - 2);
+      }
+    }
   }
 
   private drawCursor(ctx: CanvasRenderingContext2D) {

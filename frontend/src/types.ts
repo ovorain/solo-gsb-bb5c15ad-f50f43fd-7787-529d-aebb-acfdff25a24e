@@ -142,3 +142,91 @@ export interface DatasetDetail {
   picks: Pick[];
   reviews: Review[];
 }
+
+// ------------------------------------------------------- correlation -------
+export type CorrelationReason =
+  | "template_constant"
+  | "constant_window"
+  | "no_channel"
+  | "insufficient_coverage"
+  | "below_threshold";
+
+export interface CorrelationTemplateInfo {
+  pick_id: number;
+  station: string;
+  phase: Phase;
+  time: number;
+  channel: string;
+  half_window_ms: number;
+  sample_rate: number;
+  template_samples: number;
+}
+
+export interface CorrelationResult {
+  station: string;
+  phase: Phase;
+  channel: string;
+  available: boolean;
+  coefficient: number | null;
+  shift_ms: number | null;
+  time: number | null;
+  window_start: number | null;
+  window_end: number | null;
+  reason: CorrelationReason | null;
+  reason_text?: string;
+  meets_threshold?: boolean;
+  lag_samples?: number;
+}
+
+export interface CorrelationParams {
+  template_pick_id: number;
+  channel: string;
+  half_window_ms: number;
+  max_shift_ms: number;
+  min_coefficient: number;
+  target_stations?: string[] | null;
+}
+
+export interface CorrelationPreview {
+  template: CorrelationTemplateInfo;
+  max_shift_ms: number;
+  min_coefficient: number;
+  results: CorrelationResult[];
+}
+
+export interface CorrelationCreatedPick {
+  id: number;
+  station: string;
+  phase: Phase;
+  time: number;
+  uncertainty: number;
+  source: string;
+  weight: number;
+  status: "candidate";
+  coefficient: number | null;
+  shift_ms: number | null;
+}
+
+export interface CorrelationSkipped {
+  station: string;
+  phase: Phase;
+  time: number;
+  coefficient: number | null;
+  shift_ms: number | null;
+  reason: string;
+  reason_text: string;
+  existing_pick_id?: number;
+  existing_status?: string;
+}
+
+export interface CorrelationOutcome {
+  created: CorrelationCreatedPick[];
+  skipped: CorrelationSkipped[];
+  below_threshold: CorrelationSkipped[];
+  unavailable: CorrelationResult[];
+}
+
+export interface CorrelationApplyResponse {
+  propagation: CorrelationOutcome;
+  analysis: Analysis;
+}
