@@ -111,6 +111,29 @@ def create_pick(ds_id: int, station: str, phase: str, time_ms: int,
     return dict(r)
 
 
+def create_picks_bulk(ds_id: int, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Insert several picks in a single transaction.
+
+    Each item needs station / phase / time / uncertainty / source / weight.
+    Duplicate (station, phase, time) rows are the caller's responsibility to
+    filter; this function only persists what it is given.
+    """
+    stamp = ms_to_iso(now_ms())
+    created: list[dict[str, Any]] = []
+    with db() as conn:
+        for it in items:
+            cur = conn.execute(
+                "INSERT INTO picks (dataset_id, station, phase, time, uncertainty, "
+                "source, weight, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'candidate', ?)",
+                (ds_id, it["station"], it["phase"], it["time"],
+                 it["uncertainty"], it["source"], it["weight"], stamp),
+            )
+            r = conn.execute(
+                "SELECT * FROM picks WHERE id = ?", (cur.lastrowid,)).fetchone()
+            created.append(dict(r))
+    return created
+
+
 def update_pick(ds_id: int, pick_id: int, *, time_ms: int | None = None,
                 uncertainty_ms: int | None = None, weight: float | None = None,
                 phase: str | None = None) -> None:

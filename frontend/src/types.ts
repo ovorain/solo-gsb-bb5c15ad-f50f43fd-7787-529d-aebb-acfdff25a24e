@@ -142,3 +142,45 @@ export interface DatasetDetail {
   picks: Pick[];
   reviews: Review[];
 }
+
+export interface CorrelationParams {
+  pick_id: number;
+  channel: string;
+  window_ms: number;
+  max_shift_ms: number;
+  min_cc: number;
+  stations: string[];
+}
+
+export interface CorrelationResult {
+  station: string;
+  usable: boolean;
+  reason: string | null;
+  suggested_time: number | null;
+  shift_ms: number | null;
+  cc: number | null;
+  meets_threshold: boolean;
+}
+
+export interface CorrelationTemplateInfo {
+  pick_id: number;
+  station: string;
+  phase: Phase;
+  time: number;
+  time_iso: string;
+  channel: string;
+  window_ms: number;
+  max_shift_ms: number;
+  min_cc: number;
+}
+
+export interface CorrelationPreview {
+  template: CorrelationTemplateInfo;
+  results: CorrelationResult[];
+}
+
+export interface CorrelationApplyResponse {
+  created: Pick[];
+  skipped: { station: string; reason: string }[];
+  analysis: Analysis;
+}

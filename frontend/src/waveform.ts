@@ -1,5 +1,5 @@
 import type {
-  Analysis, AugmentedPick, Phase, Pick, Review, Trace,
+  Analysis, AugmentedPick, CorrelationResult, Phase, Pick, Review, Trace,
 } from "./types.js";
 import { msToIso, niceStep } from "./time.js";
 
@@ -35,6 +35,13 @@ const PICK_LANE_H = 18;   // chip rows at the top of each block
 const MAX_PICK_LANES = 3;
 const CHANNEL_COLORS = ["#7fb4ff", "#69c8c0", "#b39ddb"];
 const PHASE_COLOR: Record<Phase, string> = { P: "#ff7a59", S: "#46d39a" };
+const CORR_COLOR = "#4da3ff";
+
+export interface CorrelationOverlay {
+  phase: Phase;
+  halfWindowMs: number;
+  results: CorrelationResult[];
+}
 
 export interface WaveCallbacks {
   onPickAt: (station: string, phase: Phase, timeMs: number) => void;
@@ -61,6 +68,7 @@ export class WaveformView {
 
   private selectedPickId: number | null = null;
   private newPhase: Phase = "P";
+  private corrOverlay: CorrelationOverlay | null = null;
 
   // interaction
   private drag:
@@ -109,6 +117,18 @@ export class WaveformView {
 
   setNewPhase(phase: Phase) {
     this.newPhase = phase;
+  }
+
+  setCorrelationOverlay(overlay: CorrelationOverlay | null) {
+    this.corrOverlay = overlay;
+    this.draw();
+  }
+
+  /** Zoom onto the suggested window of one correlation preview result. */
+  focusCorrelation(result: CorrelationResult, halfWindowMs: number) {
+    if (result.suggested_time == null) return;
+    const span = Math.max(halfWindowMs * 4, 2000);
+    this.focusTime(result.suggested_time, span);
   }
 
   resetView() {
@@ -208,6 +228,7 @@ export class WaveformView {
     for (const b of this.blocks) {
       this.drawBlock(ctx, b);
     }
+    this.drawCorrelationOverlay(ctx);
     this.drawCursor(ctx);
   }
 
@@ -420,6 +441,53 @@ export class WaveformView {
     ctx.fillStyle = this.hexA(color, 0.18);
     const wy = b.y + b.height - 7;
     ctx.fillRect(x1, wy, Math.max(1, x2 - x1), 4);
+  }
+
+  private drawCorrelationOverlay(ctx: CanvasRenderingContext2D) {
+    const ov = this.corrOverlay;
+    if (!ov) return;
+    for (const b of this.blocks) {
+      const r = ov.results.find(x =>
+        x.usable && x.suggested_time != null && x.station === b.station);
+      if (!r || r.suggested_time == null) continue;
+      const x = this.xFor(r.suggested_time);
+      if (x < LABEL_W || x > this.width - RIGHT_PAD) continue;
+      const top = b.y + BLOCK_HEADER_H;
+      const bottom = b.y + b.height - BLOCK_GAP;
+
+      const x1 = this.xFor(Math.max(this.view.startMs,
+        r.suggested_time - ov.halfWindowMs));
+      const x2 = this.xFor(Math.min(this.view.endMs,
+        r.suggested_time + ov.halfWindowMs));
+      ctx.fillStyle = this.hexA(CORR_COLOR,
+        r.meets_threshold ? 0.10 : 0.05);
+      ctx.fillRect(x1, top, Math.max(1, x2 - x1), bottom - top);
+
+      ctx.strokeStyle = this.hexA(CORR_COLOR,
+        r.meets_threshold ? 0.9 : 0.4);
+      ctx.setLineDash(r.meets_threshold ? [] : [3, 4]);
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(x, top);
+      ctx.lineTo(x, bottom);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // coefficient chip just under the block header
+      const label = `cc ${r.cc == null ? "" : r.cc.toFixed(3)}`;
+      ctx.font = "bold 10px monospace";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      const w = 64, h = 14, cy = top + PICK_LANE_H * MAX_PICK_LANES - 2;
+      ctx.fillStyle = r.meets_threshold ? "#1d3a5f" : "#2c333d";
+      this.roundRect(ctx, x - w / 2, cy - h / 2, w, h, 4);
+      ctx.fill();
+      ctx.strokeStyle = r.meets_threshold ? CORR_COLOR : "#6b7686";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      ctx.fillStyle = r.meets_threshold ? "#bcd9ff" : "#8a98a9";
+      ctx.fillText(label, x, cy + 0.5);
+    }
   }
 
   private drawCursor(ctx: CanvasRenderingContext2D) {

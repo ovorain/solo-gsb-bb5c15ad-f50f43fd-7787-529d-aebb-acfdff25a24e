@@ -37,6 +37,8 @@
         <span class="hint">滚轮缩放 · 右键/Shift+拖拽平移 · 左键波形空白添加 · 拖拽标记调整 · 双击标记删除</span>
         <span class="spacer"></span>
         <button id="btn-reset-view" class="btn btn-small">重置视图</button>
+        <button id="btn-correlate" class="btn btn-small" disabled
+                title="以一条现有拾取为模板，通过互相关在其它台站传播到时">🔗 相关传播</button>
         <span id="cursor-time" class="cursor-time"></span>
       </div>
       <div id="wave-scroll" class="wave-scroll">
@@ -52,6 +54,8 @@
         <label>±不确定窗 <input id="pe-unc" type="number" min="0" step="10" /> ms</label>
         <label>权重 <input id="pe-weight" type="number" min="0.01" step="0.1" /></label>
         <span class="spacer"></span>
+        <button id="pe-correlate" class="btn btn-small"
+                title="以此拾取为模板做相关传播">🔗 传播</button>
         <button id="pe-reject" class="btn btn-small">拒绝</button>
         <button id="pe-accept" class="btn btn-small btn-primary">接受此条</button>
         <button id="pe-delete" class="btn btn-small btn-danger">删除</button>

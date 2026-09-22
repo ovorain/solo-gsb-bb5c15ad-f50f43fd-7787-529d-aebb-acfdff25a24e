@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from . import crud
 from .config import STATIC_DIR
 from .consensus import analyze
+from .correlation import TraceView, TemplateError, correlate, prepare_template
 from .database import init_db
 from .demo import create_demo_dataset
 from .importer import ImportError_, parse_payload
@@ -61,6 +62,15 @@ class ConflictGroupRef(BaseModel):
 
 class ConflictResolveIn(BaseModel):
     groups: list[ConflictGroupRef] = Field(min_length=1)
+
+
+class CorrelationIn(BaseModel):
+    pick_id: int
+    channel: str = Field(min_length=1, max_length=16)
+    window_ms: int = Field(gt=0, le=60_000)          # half-width around the pick
+    max_shift_ms: int = Field(ge=0, le=120_000)
+    min_cc: float = Field(ge=-1.0, le=1.0)
+    stations: list[str] = Field(min_length=1)
 
 
 # ------------------------------------------------------------- datasets ------
@@ -186,6 +196,143 @@ def api_delete_dataset(ds_id: int) -> dict[str, str]:
     _require_dataset(ds_id)
     crud.delete_dataset(ds_id)
     return {"status": "deleted"}
+
+
+# --------------------------------------------------------- correlation ------
+def _correlation_setup(
+    ds_id: int, body: CorrelationIn,
+) -> tuple[dict[str, Any], TraceView, dict[str, TraceView]]:
+    """Validate template pick / traces and build TraceView lookup."""
+    pick = crud.get_pick(ds_id, body.pick_id)
+    if pick is None:
+        raise HTTPException(status_code=404, detail="template pick not found")
+
+    by_key: dict[tuple[str, str], TraceView] = {}
+    for row in crud.get_traces(ds_id):
+        by_key.setdefault((row["station"], row["channel"]),
+                          TraceView.from_row(row))
+
+    template = by_key.get((pick["station"], body.channel))
+    if template is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"模板台站 {pick['station']} 没有通道 {body.channel} 的波形")
+    try:
+        prepare_template(template, pick["time"], body.window_ms)
+    except TemplateError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return pick, template, by_key
+
+
+def _dedup_stations(raw: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for s in raw:
+        s = s.strip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+def _correlation_results(
+    ds_id: int, body: CorrelationIn,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    pick, template, by_key = _correlation_setup(ds_id, body)
+    results: list[dict[str, Any]] = []
+    for station in _dedup_stations(body.stations):
+        target = by_key.get((station, body.channel))
+        if target is None:
+            results.append({
+                "station": station, "usable": False,
+                "reason": f"台站 {station} 没有通道 {body.channel} 的波形",
+                "suggested_time": None, "shift_ms": None, "cc": None,
+                "meets_threshold": False,
+            })
+            continue
+        r = correlate(template, target, pick["time"],
+                      body.window_ms, body.max_shift_ms)
+        r["station"] = station
+        r["meets_threshold"] = r["usable"] and r["cc"] >= body.min_cc
+        results.append(r)
+    return pick, results
+
+
+def _correlation_payload(
+    pick: dict[str, Any], body: CorrelationIn,
+    results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "template": {
+            "pick_id": pick["id"], "station": pick["station"],
+            "phase": pick["phase"], "time": pick["time"],
+            "time_iso": ms_to_iso(pick["time"]),
+            "channel": body.channel, "window_ms": body.window_ms,
+            "max_shift_ms": body.max_shift_ms, "min_cc": body.min_cc,
+        },
+        "results": results,
+    }
+
+
+@app.post("/api/datasets/{ds_id}/correlation/preview")
+def api_correlation_preview(ds_id: int, body: CorrelationIn) -> dict[str, Any]:
+    _require_dataset(ds_id)
+    pick, results = _correlation_results(ds_id, body)
+    return _correlation_payload(pick, body, results)
+
+
+@app.post("/api/datasets/{ds_id}/correlation/apply")
+def api_correlation_apply(ds_id: int, body: CorrelationIn) -> dict[str, Any]:
+    _require_dataset(ds_id)
+    # Always recomputed server-side (same principle as conflict resolution),
+    # so a stale preview cannot create sub-threshold picks.
+    pick, results = _correlation_results(ds_id, body)
+
+    existing: dict[tuple[str, str, int], dict[str, Any]] = {
+        (p["station"], p["phase"], p["time"]): p
+        for p in crud.get_picks(ds_id)
+    }
+    status_label = {"candidate": "候选", "rejected": "已拒绝"}
+
+    to_create: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for r in results:
+        station = r["station"]
+        if not r["usable"]:
+            skipped.append({"station": station, "reason": r["reason"]})
+            continue
+        if r["cc"] < body.min_cc:
+            skipped.append({
+                "station": station,
+                "reason": f"相关系数 {r['cc']:.3f} 低于阈值 {body.min_cc:g}",
+            })
+            continue
+        t = r["suggested_time"]
+        dup = existing.get((station, pick["phase"], t))
+        if dup is not None:
+            skipped.append({
+                "station": station,
+                "reason": f"已存在同震相同到时拾取 #{dup['id']}"
+                          f"（{status_label.get(dup['status'], dup['status'])}）",
+            })
+            continue
+        item = {
+            "station": station, "phase": pick["phase"], "time": t,
+            "uncertainty": pick["uncertainty"],
+            "source": f"corr:{pick['station']}",
+            "weight": min(1.0, max(0.01, round(r["cc"], 3))),
+        }
+        to_create.append(item)
+        # A later station cannot duplicate one created in the same call.
+        existing[(station, pick["phase"], t)] = {
+            "id": -1, "status": "candidate"}
+
+    created = crud.create_picks_bulk(ds_id, to_create)
+
+    fresh = analyze(crud.get_picks(ds_id))
+    fresh["reviews"] = crud.get_reviews(ds_id)
+    fresh["last_resolution"] = crud.get_last_conflict_resolution(ds_id)
+    return {"created": created, "skipped": skipped, "analysis": fresh}
 
 
 @app.get("/api/datasets/{ds_id}/export")

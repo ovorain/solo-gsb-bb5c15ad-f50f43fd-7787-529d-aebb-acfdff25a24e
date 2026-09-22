@@ -1,6 +1,7 @@
 import { api } from "./api.js";
+import { CorrelationModal } from "./correlation.js";
 import type {
-  Analysis, AugmentedPick, Group, Phase, Pick,
+  Analysis, AugmentedPick, CorrelationPreview, Group, Phase, Pick,
 } from "./types.js";
 import { WaveformView } from "./waveform.js";
 import { ReviewPanel } from "./panel.js";
@@ -20,6 +21,9 @@ class App {
 
   private wave: WaveformView;
   private panel: ReviewPanel;
+  private corrModal: CorrelationModal;
+  private traces: Awaited<ReturnType<typeof api.getDetail>>["traces"] = [];
+  private detailPicks: Pick[] = [];
 
   constructor() {
     this.wave = new WaveformView(
@@ -49,7 +53,34 @@ class App {
     });
 
     this.bindChrome();
+    this.corrModal = new CorrelationModal({
+      onPreviewOverlay: (preview: CorrelationPreview | null) =>
+        this.showCorrelationOverlay(preview),
+      onLocate: (result, halfWindowMs) => {
+        this.wave.focusCorrelation(result, halfWindowMs);
+      },
+      onApplied: (created, skipped) => {
+        this.toast(`相关传播完成：新建 ${created} 条，跳过 ${skipped} 个台站`);
+        void this.reloadAnalysis();
+      },
+    });
     void this.bootstrap();
+  }
+
+  // --------------------------------------------------- correlation tool ----
+  private showCorrelationOverlay(preview: CorrelationPreview | null) {
+    this.wave.setCorrelationOverlay(preview && {
+      phase: preview.template.phase,
+      halfWindowMs: preview.template.window_ms,
+      results: preview.results,
+    });
+  }
+
+  private openCorrelation(preselectPickId?: number) {
+    if (this.dsId == null) return;
+    this.corrModal.open(
+      this.dsId, this.detailPicks, this.traces,
+      preselectPickId ?? undefined);
   }
 
   // ------------------------------------------------------------ chrome -----
@@ -88,6 +119,8 @@ class App {
         await api.deleteDataset(this.dsId!);
         this.dsId = null;
         this.analysis = null;
+        this.traces = [];
+        this.detailPicks = [];
         this.selectPick(null);
         this.wave.clear();
         this.panel.render({
@@ -97,11 +130,14 @@ class App {
         $("#empty-state").style.display = "";
         $("#btn-export").disabled = true;
         $("#btn-delete").disabled = true;
+        $("#btn-correlate").disabled = true;
         await this.refreshDatasetList(null);
       }, "删除失败");
     });
     $("#btn-reset-view").addEventListener("click", () =>
       this.wave.resetView());
+    $("#btn-correlate").addEventListener("click", () =>
+      this.openCorrelation(this.selectedPickId ?? undefined));
 
     document.querySelectorAll<HTMLInputElement>("input[name='new-phase']")
       .forEach(r => r.addEventListener("change", () => {
@@ -136,6 +172,11 @@ class App {
     $("#pe-delete").addEventListener("click", () => {
       const p = this.selectedPick();
       if (p) this.deletePick(p);
+    });
+    $("#pe-correlate").addEventListener("click", () => {
+      if (this.selectedPickId != null) {
+        this.openCorrelation(this.selectedPickId);
+      }
     });
   }
 
@@ -174,6 +215,8 @@ class App {
     this.selectPick(null);
     const detail = await api.getDetail(id);
     this.fullStart = detail.dataset.start_time;
+    this.traces = detail.traces;
+    this.detailPicks = detail.picks;
     const analysis = await api.getAnalysis(id);
     this.analysis = analysis;
     this.wave.setData(detail.traces, analysis);
@@ -181,11 +224,14 @@ class App {
     $("#empty-state").style.display = "none";
     $("#btn-export").disabled = false;
     $("#btn-delete").disabled = false;
+    $("#btn-correlate").disabled = false;
   }
 
   private async reloadAnalysis() {
     if (this.dsId == null) return;
     this.analysis = await api.getAnalysis(this.dsId);
+    // keep the template-pick list in sync with persisted picks
+    this.detailPicks = (await api.getDetail(this.dsId)).picks;
     this.applyAnalysis(this.analysis);
   }
 
